@@ -162,6 +162,14 @@ class CandidateAgent:
                 if not text:
                     self.stop("needs_human", "Model returned neither text nor a tool request.")
                     return self._say("I couldn't continue reliably; this needs human review.")
+                if re.search(r"%|\bpercent(?:age)?\b", text, re.I) and re.search(
+                    r"\b(?:convert|divide|enter)\b", text, re.I
+                ):
+                    text = (
+                        "Please share your official CGPA on a 10-point scale. A percentage "
+                        "cannot be converted reliably without your institution's grading rules."
+                    )
+                    session.history[-1]["content"] = text
                 if re.search(
                     r"\b(saved|submitted)\b|\b(?:application|information|record)\s+"
                     r"(?:is\s+|has been\s+)?(?:complete|completed|updated)\b",

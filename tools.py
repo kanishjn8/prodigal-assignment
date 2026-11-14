@@ -10,6 +10,16 @@ from validators import analyze_candidate, compute_patch, is_candidate_complete, 
 
 TRACKING_FIELDS = {"collection_status", "attempt_count", "last_contacted_at", "notes"}
 PROFILE_FIELDS = WRITABLE_FIELDS - TRACKING_FIELDS
+PROFILE_PROPERTIES = {key: {"type": "string"} for key in sorted(PROFILE_FIELDS)}
+PROFILE_PROPERTIES.update(
+    {
+        "cgpa": {"type": "number", "description": "JSON number on a 10-point scale, not a string."},
+        "graduation_year": {"type": "integer"},
+        "internship_duration_months": {"type": "integer"},
+        "skills": {"type": "array", "items": {"type": "string"}},
+    }
+)
+PROFILE_SCHEMA = {"type": "object", "properties": PROFILE_PROPERTIES, "additionalProperties": False}
 
 
 class CandidateAPI(Protocol):
@@ -83,7 +93,7 @@ TOOL_SCHEMAS = [
         "Validate candidate-provided values without saving. Supply exact short quotes for each "
         "value from a candidate reply after identity confirmation.",
         {
-            "information": {"type": "object", "description": "Candidate field/value pairs."},
+            "information": PROFILE_SCHEMA,
             "evidence": {
                 "type": "object",
                 "additionalProperties": {"type": "string"},
@@ -96,7 +106,7 @@ TOOL_SCHEMAS = [
         "Save previously validated values; never change correct "
         "existing values. Check success before saying saved.",
         {
-            "updates": {"type": "object", "description": "Validated candidate field/value pairs."},
+            "updates": PROFILE_SCHEMA,
         },
     ),
     _schema(
@@ -187,6 +197,14 @@ class CandidateTools:
                 "unsupported_fields", "Only writable candidate profile fields are allowed."
             )
         result = validate_fields(information)
+        for key in {"cgpa", "graduation_year", "internship_duration_months"} & information.keys():
+            value = information[key]
+            if isinstance(value, str) and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+                result["errors"][key] = (
+                    "Extraction type error: retry this value as an unquoted JSON number "
+                    "using the same evidence. Do not ask the candidate to clarify the scale "
+                    "just because you supplied a string."
+                )
         for key in information:
             session.validated_values.pop(key, None)
         for key in list(result["data"]):
@@ -290,6 +308,11 @@ class CandidateTools:
         try:
             updated = self.api.update_candidate(session.candidate_id, patch, session.version)
             session.refresh(updated)
+        except KeyboardInterrupt:
+            # An interrupted write may have reached the server; never retry it with a fresh key.
+            session.write_blocked = True
+            session.last_error = "interrupted_write"
+            raise
         except VersionConflict as exc:
             session.validated_values.clear()
             if exc.latest_candidate is not None:
