@@ -6,6 +6,7 @@ from typing import Any
 from ollama import Client
 
 import config
+from outcomes import requested_exit
 from tools import TOOL_SCHEMAS, AgentSession, CandidateAPI, CandidateTools
 from validators import is_candidate_complete
 
@@ -33,9 +34,18 @@ class CandidateAgent:
         self.max_tool_rounds = max_tool_rounds
         self.started = False
         if is_candidate_complete(record):
-            self.session.outcome = "completed"
-            self.session.ended = True
-            return
+            if record.get("collection_status") != "completed":
+                # No attempted contact: only correct the status, with no contact metadata writes.
+                result = self.tools._write({"collection_status": "completed"})
+                if not result["ok"]:
+                    self.session.outcome = "needs_human"
+                    self.session.ended = True
+                    return
+            if is_candidate_complete(self.session.latest_candidate):
+                self.session.outcome = "completed"
+                self.session.outcome_persisted = True
+                self.session.ended = True
+                return
         prompt = (config.PROJECT_ROOT / "prompts/system_prompt.txt").read_text()
         self.session.history.append({"role": "system", "content": prompt})
 
@@ -59,6 +69,40 @@ class CandidateAgent:
             raise ValueError("A nonempty candidate reply is required.")
         session = self.session
         session.history.append({"role": "user", "content": message})
+        intent = requested_exit(message)
+        if (
+            session.identity != "confirmed"
+            and intent is None
+            and re.match(
+                r"^(?:no\b|nope\b|(?:i am|i'm) not\b|my name is not\b)",
+                message.strip(),
+                re.I,
+            )
+        ):
+            session.identity = "denied"
+            intent = {
+                "collection_status": "needs_human",
+                "notes": "Identity denied: " + message,
+                "refused_fields": [],
+            }
+        if intent and (
+            intent["collection_status"] == "needs_human" or session.identity != "confirmed"
+        ):
+            if re.search(
+                r"wrong (?:person|number)|not me|not my (?:record|application)|someone else's",
+                message,
+                re.I,
+            ):
+                session.identity = "denied"
+            if intent["collection_status"] == "refused":
+                intent = {
+                    "collection_status": "no_answer",
+                    "notes": intent["notes"],
+                    "refused_fields": [],
+                }
+            session.requested_outcome = intent
+            self.stop()
+            return self._say(self._outcome_message())
         if session.identity != "confirmed":
             answer = message.strip().casefold().rstrip(".! ")
             if answer in {"no", "nope", "wrong person", "wrong number", "not me"}:
@@ -85,6 +129,7 @@ class CandidateAgent:
         else:
             session.candidate_messages.append(message)
             session.validated_values.clear()
+            session.requested_outcome = intent
         return self._run_turn()
 
     def _say(self, message: str) -> str:
@@ -111,14 +156,25 @@ class CandidateAgent:
                 action = "Call save_candidate_information now with updates=" + json.dumps(
                     session.validated_values
                 )
-            elif is_candidate_complete(session.latest_candidate):
+            elif session.requested_outcome:
+                action = (
+                    "The candidate requested an exit. Validate and save any other explicit "
+                    "answers in their latest reply, then finish with "
+                    + json.dumps(session.requested_outcome)
+                    + ". Do not ask another question or schedule anything."
+                )
+            elif self.tools.ready_to_complete():
                 available_tools = TOOL_SCHEMAS[3:]
                 action = "Call finish_collection now with completed, notes and refused_fields=[]."
             messages = deepcopy(session.history)
             messages[0]["content"] += (
                 "\nAPPLICATION STATE: Identity confirmed. " + action + " " + correction
             )
-            if session.validated_values or is_candidate_complete(session.latest_candidate):
+            if (
+                session.validated_values
+                or self.tools.ready_to_complete()
+                or session.requested_outcome
+            ):
                 # Application control is never added to candidate evidence.
                 messages.append(
                     {
@@ -149,13 +205,17 @@ class CandidateAgent:
             calls = assistant.get("tool_calls") or []
             if not calls:
                 text = assistant.get("content", "").strip()
+                if session.requested_outcome and not session.validated_values:
+                    session.history.pop()
+                    self.stop()
+                    return self._say(self._outcome_message())
                 if not inspected or any(
                     schema["function"]["name"] in text for schema in TOOL_SCHEMAS
                 ):
                     session.history.pop()
                     correction = "Emit a native tool call, never simulated tool results in prose."
                     continue
-                if session.validated_values or is_candidate_complete(session.latest_candidate):
+                if session.validated_values or self.tools.ready_to_complete():
                     session.history.pop()
                     correction = "The operation is still pending. Emit a native tool call now."
                     continue
@@ -195,6 +255,12 @@ class CandidateAgent:
                 )
             if session.ended:
                 return self._say(self._outcome_message())
+            if session.disputed_fields:
+                session.requested_outcome = None
+                self.stop(
+                    "needs_human", "Disputed fields: " + ", ".join(sorted(session.disputed_fields))
+                )
+                return self._say(self._outcome_message())
             if limited:
                 break
         self.stop("needs_human", "Tool-call safety limit reached; review before continuing.")
@@ -213,6 +279,8 @@ class CandidateAgent:
         return replacement
 
     def _outcome_message(self) -> str:
+        if not self.session.outcome_persisted:
+            return "I'll stop here. Saving the outcome was not confirmed; human review is needed."
         return {
             "completed": "Thank you! Your application information is complete and saved.",
             "in_progress": "We'll stop here. Your progress and follow-up notes have been saved.",
@@ -227,17 +295,17 @@ class CandidateAgent:
         """Host hook for a future CLI's timeout, quit or failure handling."""
         if self.session.ended:
             return {"ok": self.session.outcome_persisted, "ended": True}
-        if status == "no_answer" and self.session.confirmed_values:
+        if status == "no_answer" and (
+            self.session.confirmed_values or self.session.validated_values
+        ):
             status = "in_progress"
             notes = "Candidate left after providing information; retain saved progress."
-        result = self.tools.execute(
-            "finish_collection",
-            {
-                "collection_status": status,
-                "notes": notes,
-                "refused_fields": [],
-            },
-        )
+        arguments = self.session.requested_outcome or {
+            "collection_status": status,
+            "notes": notes,
+            "refused_fields": [],
+        }
+        result = self.tools.execute("finish_collection", arguments)
         if not result["ok"]:
             self.session.last_error = result.get("error")
             self.session.outcome = "needs_human"

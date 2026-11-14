@@ -170,7 +170,7 @@ def test_http_errors_are_safe_and_not_retried(make_client, status, kind):
     assert caught.value.status_code == status
     assert caught.value.idempotency_key
     assert "test-key" not in str(caught.value)
-    assert len(requests) == 1
+    assert len(requests) == (2 if status == 503 else 1)
     if status == 429:
         assert caught.value.retry_after == "60"
 

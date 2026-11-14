@@ -109,11 +109,13 @@ def test_missing_model(setup_cli, monkeypatch, capsys) -> None:
 
 
 def test_complete_candidate_does_not_chat(setup_cli, capsys) -> None:
-    api, llm = setup_cli(record={**RECORD, "email": "test@example.com"})
+    api, llm = setup_cli(
+        record={**RECORD, "email": "test@example.com", "collection_status": "completed"}
+    )
     assert main.main(["--candidate-id", "c-test"]) == 0
     output = capsys.readouterr().out
     assert "No chat" in output and "Agent:" not in output
-    assert not llm.requests and not api.writes and api.get_count == 1
+    assert not llm.requests and not api.writes and api.get_count == 2
 
 
 def test_identity_greeting_and_quit(setup_cli, capsys) -> None:

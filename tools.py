@@ -6,7 +6,14 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from api_client import WRITABLE_FIELDS, APIError, VersionConflict
-from validators import analyze_candidate, compute_patch, is_candidate_complete, validate_fields
+from outcomes import outcome_notes
+from validators import (
+    MANDATORY_FIELDS,
+    analyze_candidate,
+    compute_patch,
+    is_candidate_complete,
+    validate_fields,
+)
 
 TRACKING_FIELDS = {"collection_status", "attempt_count", "last_contacted_at", "notes"}
 PROFILE_FIELDS = WRITABLE_FIELDS - TRACKING_FIELDS
@@ -58,6 +65,8 @@ class AgentSession:
     contacted_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     contact_recorded: bool = False
     last_error: str | None = None
+    requested_outcome: dict[str, Any] | None = None
+    disputed_fields: set[str] = field(default_factory=set)
 
     def refresh(self, record: dict[str, Any]) -> None:
         if record.get("id") != self.candidate_id:
@@ -153,6 +162,11 @@ class CandidateTools:
             return registry[name](**arguments)
         except (TypeError, ValueError):
             return _error("invalid_arguments", "Arguments did not match the tool schema or rules.")
+        except Exception:
+            self.session.last_error = "tool_failure"
+            if name in {"save_candidate_information", "finish_collection"}:
+                self.session.write_blocked = True
+            return _error("tool_failure", "Tool failed unexpectedly; request human review.")
 
     def inspect_candidate_state(self) -> dict[str, Any]:
         session = self.session
@@ -188,6 +202,8 @@ class CandidateTools:
         evidence: dict[str, str],
     ) -> dict[str, Any]:
         session = self.session
+        if session.ended:
+            return _error("session_ended", "The session has ended.")
         if session.identity != "confirmed":
             return _error("identity_required", "Confirm identity by name before collecting data.")
         if not isinstance(information, dict) or not isinstance(evidence, dict):
@@ -197,6 +213,10 @@ class CandidateTools:
                 "unsupported_fields", "Only writable candidate profile fields are allowed."
             )
         result = validate_fields(information)
+        refused = set((session.requested_outcome or {}).get("refused_fields", []))
+        for key in refused & information.keys():
+            result["data"].pop(key, None)
+            result["errors"][key] = "Candidate declined this field; do not collect or save it."
         for key in {"cgpa", "graduation_year", "internship_duration_months"} & information.keys():
             value = information[key]
             if isinstance(value, str) and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
@@ -212,7 +232,9 @@ class CandidateTools:
             if not self._has_evidence(key, information[key], quote):
                 result["errors"][key] = "Quote the exact value from a confirmed candidate reply."
                 del result["data"][key]
-        session.validation_errors = dict(result["errors"])
+        session.validation_errors.update(result["errors"])
+        for key in result["data"]:
+            session.validation_errors.pop(key, None)
         session.validated_values.update(deepcopy(result["data"]))
         return {"ok": not result["errors"], "data": result["data"], "errors": result["errors"]}
 
@@ -228,6 +250,12 @@ class CandidateTools:
         source: Any = quote
         if key in {"cgpa", "graduation_year", "internship_duration_months"}:
             message = self.session.candidate_messages[-1]
+            if re.search(
+                r"\b(?:around|about|roughly|approximately|maybe)\s+" + re.escape(quote),
+                message,
+                re.I,
+            ):
+                return False
             if not re.search(r"(?<![\w.+-])" + re.escape(quote) + r"(?![\w.])", message):
                 return False
             if key == "cgpa" and re.search(
@@ -252,11 +280,15 @@ class CandidateTools:
 
     def save_candidate_information(self, updates: dict[str, Any]) -> dict[str, Any]:
         session = self.session
+        if session.ended:
+            return _error("session_ended", "The session has ended.")
         if session.identity != "confirmed":
             return _error("identity_required", "Confirm identity before saving candidate data.")
         if not isinstance(updates, dict) or not updates or not updates.keys() <= PROFILE_FIELDS:
             return _error("unsupported_fields", "Supply writable candidate profile fields only.")
         validated = validate_fields(updates)
+        if updates.keys() & set((session.requested_outcome or {}).get("refused_fields", [])):
+            return _error("refused_field", "Respect the candidate's refusal.")
         if not validated["valid"]:
             return {"ok": False, "error": "validation", "errors": validated["errors"]}
         for key, value in validated["data"].items():
@@ -264,13 +296,15 @@ class CandidateTools:
                 return _error(
                     "validation_required", "Validate quoted candidate input before saving."
                 )
-            if key in session.conflict_fields:
+            if key in session.conflict_fields and session.latest_candidate.get(key) != value:
                 return _error(
                     "conflict", "A concurrent edit changed this field; needs human review."
                 )
             existing = session.latest_candidate.get(key)
             old_result = validate_fields({key: existing})
             if old_result["valid"] and existing != value and old_result["data"][key] != value:
+                session.disputed_fields.add(key)
+                session.validated_values.pop(key, None)
                 return _error(
                     "existing_value", "Keep existing valid data; escalate disputed values."
                 )
@@ -298,6 +332,10 @@ class CandidateTools:
 
     def _write(self, changes: dict[str, Any]) -> dict[str, Any]:
         session = self.session
+        if session.ended:
+            return _error("session_ended", "The session has ended.")
+        if changes.keys() & PROFILE_FIELDS and session.identity != "confirmed":
+            return _error("identity_required", "Identity must be confirmed before profile writes.")
         if session.write_blocked:
             return _error(
                 "write_blocked", "A previous write failed; reconcile outside this session."
@@ -322,6 +360,7 @@ class CandidateTools:
                     for key in PROFILE_FIELDS
                     if latest.get(key) != session.latest_candidate.get(key)
                 )
+                session.disputed_fields.update(session.conflict_fields & changes.keys())
                 session.refresh(latest)
             else:
                 session.write_blocked = True
@@ -341,7 +380,13 @@ class CandidateTools:
                 "saved": False,
                 "message": "Save was not confirmed. Stop writes and request human review.",
             }
-        session.contact_recorded = True
+        except (TypeError, ValueError, KeyError):
+            session.write_blocked = True
+            return _error(
+                "malformed_response", "Write result could not be verified; request review."
+            )
+        if "last_contacted_at" in patch:
+            session.contact_recorded = True
         return {
             "ok": True,
             "saved": True,
@@ -350,6 +395,13 @@ class CandidateTools:
             "updated": {key: updated.get(key) for key in patch},
         }
 
+    def ready_to_complete(self) -> bool:
+        return (
+            is_candidate_complete(self.session.latest_candidate)
+            and not self.session.disputed_fields
+            and not set(self.session.validation_errors) & set(MANDATORY_FIELDS)
+        )
+
     def finish_collection(
         self,
         collection_status: str,
@@ -357,6 +409,8 @@ class CandidateTools:
         refused_fields: list[str],
     ) -> dict[str, Any]:
         session = self.session
+        if session.ended:
+            return _error("session_ended", "The session has ended.")
         if collection_status not in {
             "completed",
             "in_progress",
@@ -371,35 +425,58 @@ class CandidateTools:
             or any(not isinstance(key, str) or key not in PROFILE_FIELDS for key in refused_fields)
         ):
             return _error("invalid_arguments", "Supply notes and valid refused field names.")
+        if (
+            session.requested_outcome
+            and collection_status != session.requested_outcome["collection_status"]
+        ):
+            return _error("requested_outcome", "Respect the candidate's requested exit outcome.")
+        if session.disputed_fields and collection_status != "needs_human":
+            return _error("dispute", "Disputed valid information requires human review.")
         if collection_status == "completed":
-            if session.identity != "confirmed" or not is_candidate_complete(
-                session.latest_candidate
-            ):
+            if session.identity != "confirmed":
                 return _error("incomplete", "Identity and all mandatory fields must be valid.")
         elif not notes.strip():
             return _error("context_required", "Describe what happened and what remains.")
-        if collection_status == "no_answer" and session.confirmed_values:
-            return _error("invalid_outcome", "Progress was saved; use in_progress instead.")
         if collection_status == "refused" and (
             session.identity != "confirmed" or not refused_fields
         ):
             return _error("refusal_required", "Confirm identity and identify refused fields.")
         if refused_fields and collection_status != "refused":
             return _error("invalid_outcome", "Refused fields require the refused outcome.")
+        # Retain validated progress even if the model finishes before issuing its save call.
+        pending = {
+            key: value
+            for key, value in session.validated_values.items()
+            if key not in refused_fields and key not in session.disputed_fields
+        }
+        if pending and session.identity == "confirmed":
+            saved = self.save_candidate_information(pending)
+            if not saved["ok"]:
+                return saved
+        if collection_status == "no_answer" and session.confirmed_values:
+            collection_status = "in_progress"
+        if collection_status == "completed" and not self.ready_to_complete():
+            return _error("incomplete", "Resolve all mandatory data and validation issues first.")
         outstanding = sorted(
             set(session.missing_fields)
             | set(session.invalid_fields)
             | set(session.pending_clarification)
+            | (set(session.validation_errors) & set(MANDATORY_FIELDS))
+            | session.disputed_fields
         )
         context = notes.strip()
         if outstanding:
             context += "\nOutstanding: " + ", ".join(outstanding)
         if refused_fields:
             context += "\nRefused: " + ", ".join(refused_fields)
-        old_notes = session.latest_candidate.get("notes") or ""
+        if session.requested_outcome:
+            context += "\n" + session.requested_outcome["notes"]
+        old_notes = session.latest_candidate.get("notes")
+        if old_notes is None:
+            old_notes = ""
         if not isinstance(old_notes, str):
             return _error("invalid_existing_notes", "Existing notes require human review.")
-        combined_notes = "\n".join(part for part in (old_notes, context) if part)
+        combined_notes = outcome_notes(old_notes, context)
         result = self._write(
             {
                 "collection_status": collection_status,

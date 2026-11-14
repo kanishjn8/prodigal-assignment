@@ -109,7 +109,7 @@ def test_missing_fields_and_snapshots() -> None:
 
 
 def test_complete_candidate_never_chats_or_writes() -> None:
-    api = FakeAPI({**RECORD, "email": "test@example.com"})
+    api = FakeAPI({**RECORD, "email": "test@example.com", "collection_status": "completed"})
     llm = FakeLLM()
     agent = CandidateAgent("c-test", api, llm=llm)
     assert agent.start() is None
@@ -405,7 +405,7 @@ def test_no_calls_after_finish_in_same_batch() -> None:
             ("save_candidate_information", {"updates": {"email": "fake@example.com"}}),
         )
     )
-    agent.respond("I want human help")
+    agent.respond("Please assist.")
     assert agent.session.tool_calls[-1]["result"]["error"] == "session_ended"
     assert len(agent.tools.api.writes) == 1
 

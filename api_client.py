@@ -143,6 +143,9 @@ class CandidateAPIClient:
                     params=params,
                     content=body,
                 )
+                if response.status_code in {502, 503, 504} and attempt + 1 < attempts:
+                    sleep(0.25)
+                    continue
                 break
             except httpx.TransportError as exc:
                 if attempt + 1 < attempts:

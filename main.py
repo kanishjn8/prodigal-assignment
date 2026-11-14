@@ -6,12 +6,14 @@ import httpx
 from ollama import Client, ResponseError
 
 import config
+import terminal_ui as ui
 from agent import CandidateAgent
 from api_client import WRITABLE_FIELDS, APIError, CandidateAPIClient
 from validators import is_candidate_complete
 
 HELP_TEXT = (
-    "/help: show commands. /quit: end the chat and record the outcome. EOF or Ctrl+C also exits."
+    "/help: show commands. /quit: end the chat. /no-answer: simulate no further response. "
+    "EOF or Ctrl+C also exits. Validated progress is retained."
 )
 
 
@@ -36,18 +38,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def chat(agent: CandidateAgent) -> None:
-    print(HELP_TEXT, flush=True)
+    print(ui.styled("  /help · /quit · /no-answer · Ctrl+C to stop", "2"), flush=True)
     greeting = agent.start()
     if greeting:
-        print(f"Agent: {greeting}", flush=True)
+        ui.agent_message(greeting)
     try:
         while not agent.session.ended:
-            reply = input("You: ").strip()
+            reply = input(ui.input_prompt()).strip()
             if reply == "/help":
                 print(HELP_TEXT, flush=True)
                 continue
-            if reply == "/quit":
-                agent.stop(notes="Candidate ended the chat with /quit.")
+            if reply in {"/quit", "/no-answer"}:
+                with ui.busy("Saving conversation outcome"):
+                    agent.stop(notes=f"Candidate ended the chat with {reply}.")
                 break
             if reply.startswith("/"):
                 print("Unknown command. Use /help or /quit.", flush=True)
@@ -55,12 +58,14 @@ def chat(agent: CandidateAgent) -> None:
             if not reply:
                 print("Please enter a reply, or use /quit to exit.", flush=True)
                 continue
-            response = agent.respond(reply)
+            with ui.busy("Thinking"):
+                response = agent.respond(reply)
             if response:
-                print(f"Agent: {response}", flush=True)
+                ui.agent_message(response)
     except (EOFError, KeyboardInterrupt):
         print("\nEnding the conversation...", flush=True)
-        agent.stop(notes="Candidate left the terminal chat (EOF or Ctrl+C).")
+        with ui.busy("Saving conversation outcome"):
+            agent.stop(notes="Candidate left the terminal chat (EOF or Ctrl+C).")
 
 
 def verify_outcome(agent: CandidateAgent, api: CandidateAPIClient) -> int:
@@ -70,7 +75,8 @@ def verify_outcome(agent: CandidateAgent, api: CandidateAPIClient) -> int:
             "Outcome could not be saved reliably. Human review is required; do not retry blindly."
         )
         return 1
-    record = api.get_candidate(session.candidate_id)
+    with ui.busy("Verifying saved changes"):
+        record = api.get_candidate(session.candidate_id)
     changed = {
         key
         for key in WRITABLE_FIELDS
@@ -85,27 +91,26 @@ def verify_outcome(agent: CandidateAgent, api: CandidateAPIClient) -> int:
             "Database verification found a mismatch or concurrent change. Human review is required."
         )
         return 1
-    print(f"Outcome: {session.outcome} (verified in database).", flush=True)
+    print(ui.styled(f"\nOutcome: {session.outcome} (verified in database).", "1;32"), flush=True)
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    ui.banner()
     agent = None
     try:
         with CandidateAPIClient() as api:
-            print("Checking candidate record...", flush=True)
             llm = Client(host=config.OLLAMA_BASE_URL, timeout=120.0)
             # The startup GET checks reachability and authentication without a redundant API call.
-            agent = CandidateAgent(args.candidate_id, api, llm=llm)
+            with ui.busy("Checking candidate record"):
+                agent = CandidateAgent(args.candidate_id, api, llm=llm)
             if agent.session.ended:
-                print(
-                    "All mandatory information is already valid. "
-                    "No chat or database changes needed."
-                )
-                return 0
-            print("Checking local Ollama model...", flush=True)
-            available = {entry.model for entry in llm.list().models}
+                if agent.session.outcome == "completed":
+                    print("All mandatory information is valid. No chat needed.")
+                return verify_outcome(agent, api)
+            with ui.busy("Connecting to local Ollama"):
+                available = {entry.model for entry in llm.list().models}
             if config.OLLAMA_MODEL not in available:
                 print(f"Local model is missing. Install it with: ollama pull {config.OLLAMA_MODEL}")
                 return 1
