@@ -1,0 +1,161 @@
+{
+  "model": "llama3.1:8b",
+  "capture": "Real local Ollama and private test API. Operator-supplied candidate replies. Names and sensitive record fields omitted.",
+  "transcript": "ACME CORP  /  INTERNSHIPS\n  Let's complete your application.\n  ──────────────────────────────────────────────────────\n\nChecking candidate record...\nConnecting to local Ollama...\n  /help · /quit · /no-answer · Ctrl+C to stop\n\nAgent: Hi! I'm ACME Corp's internship application assistant. Am I speaking with [full_name omitted]? Please reply yes or no.\nYou: yes\nReviewing your reply...\nPreparing a reply...\nChecking what’s still needed...\nPreparing a reply...\n\nAgent: Now that we have [name omitted]'s current application state, let's focus on the missing fields. [name omitted], could you please tell me the name of your college?\nYou: Can we continue tomorrow at 6 PM?\nReviewing your reply...\nPreparing a reply...\nUpdating the candidate database...\n\nAgent: We'll stop here. Your progress and follow-up notes have been saved.\nVerifying saved changes...\n\nOutcome: in_progress (verified in database).",
+  "tools": [
+    {
+      "name": "inspect_candidate_state",
+      "argument_names": [],
+      "result": {
+        "ok": true,
+        "error": null
+      }
+    },
+    {
+      "name": "finish_collection",
+      "argument_names": [
+        "collection_status",
+        "notes",
+        "refused_fields"
+      ],
+      "result": {
+        "ok": true,
+        "error": null
+      }
+    }
+  ],
+  "api": [
+    {
+      "method": "GET",
+      "response": {
+        "id": "c004",
+        "version": 1,
+        "collection_status": "pending",
+        "attempt_count": 0,
+        "internship_duration_months": 3
+      }
+    },
+    {
+      "method": "PATCH",
+      "if_match_version": 1,
+      "written_fields": [
+        "attempt_count",
+        "collection_status",
+        "last_contacted_at",
+        "notes"
+      ],
+      "response": {
+        "id": "c004",
+        "version": 2,
+        "collection_status": "in_progress",
+        "attempt_count": 1,
+        "internship_duration_months": 3
+      }
+    },
+    {
+      "method": "GET",
+      "response": {
+        "id": "c004",
+        "version": 2,
+        "collection_status": "in_progress",
+        "attempt_count": 1,
+        "internship_duration_months": 3
+      }
+    }
+  ],
+  "decisions": [
+    {
+      "event": "candidate_fetch_started"
+    },
+    {
+      "event": "candidate_plan",
+      "version": 1,
+      "missing": [
+        "college",
+        "degree",
+        "branch"
+      ],
+      "invalid": [],
+      "needs_clarification": []
+    },
+    {
+      "event": "identity_confirmed"
+    },
+    {
+      "event": "model_request",
+      "round": 1,
+      "available_tools": [
+        "inspect_candidate_state"
+      ]
+    },
+    {
+      "event": "tool_result",
+      "tool": "inspect_candidate_state",
+      "ok": true,
+      "error": null
+    },
+    {
+      "event": "model_request",
+      "round": 2,
+      "available_tools": [
+        "inspect_candidate_state",
+        "validate_candidate_information",
+        "save_candidate_information",
+        "finish_collection"
+      ]
+    },
+    {
+      "event": "model_replied_without_tools"
+    },
+    {
+      "event": "exit_detected",
+      "status": "in_progress"
+    },
+    {
+      "event": "model_request",
+      "round": 1,
+      "available_tools": [
+        "inspect_candidate_state",
+        "validate_candidate_information",
+        "save_candidate_information",
+        "finish_collection"
+      ]
+    },
+    {
+      "event": "patch_requested",
+      "fields": [
+        "attempt_count",
+        "collection_status",
+        "last_contacted_at",
+        "notes"
+      ],
+      "version": 1
+    },
+    {
+      "event": "patch_saved",
+      "fields": [
+        "attempt_count",
+        "collection_status",
+        "last_contacted_at",
+        "notes"
+      ],
+      "version": 2
+    },
+    {
+      "event": "outcome_saved",
+      "status": "in_progress"
+    },
+    {
+      "event": "tool_result",
+      "tool": "finish_collection",
+      "ok": true,
+      "error": null
+    },
+    {
+      "event": "outcome_verification",
+      "ok": true,
+      "status": "in_progress"
+    }
+  ],
+  "exit_code": 0
+}

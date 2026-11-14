@@ -1,0 +1,187 @@
+{
+  "model": "llama3.1:8b",
+  "capture": "Real local Ollama and private test API. Operator-supplied candidate replies. Names and sensitive record fields omitted.",
+  "transcript": "ACME CORP  /  INTERNSHIPS\n  Let's complete your application.\n  ──────────────────────────────────────────────────────\n\nChecking candidate record...\nConnecting to local Ollama...\n  /help · /quit · /no-answer · Ctrl+C to stop\n\nAgent: Hi! I'm ACME Corp's internship application assistant. Am I speaking with [full_name omitted]? Please reply yes or no.\nYou: yes\nReviewing your reply...\nPreparing a reply...\nChecking what’s still needed...\nPreparing a reply...\n\nAgent: It looks like you're missing the internship duration in months. Can you please tell me how many months you're available for the internship?\nYou: 5\nReviewing your reply...\nValidating your answer...\n\nAgent: Internship duration must be 2, 3, or 6 months. How many months can you intern?\nYou: 3\nReviewing your reply...\nValidating your answer...\nUpdating the candidate database...\n\nAgent: Thank you! Your application information is complete and saved.\nVerifying saved changes...\n\nOutcome: completed (verified in database).",
+  "tools": [
+    {
+      "name": "inspect_candidate_state",
+      "argument_names": [],
+      "result": {
+        "ok": true,
+        "error": null
+      }
+    }
+  ],
+  "api": [
+    {
+      "method": "GET",
+      "response": {
+        "id": "c002",
+        "version": 4,
+        "collection_status": "in_progress",
+        "attempt_count": 1,
+        "internship_duration_months": null
+      }
+    },
+    {
+      "method": "PATCH",
+      "if_match_version": 4,
+      "written_fields": [
+        "attempt_count",
+        "internship_duration_months",
+        "last_contacted_at"
+      ],
+      "response": {
+        "id": "c002",
+        "version": 5,
+        "collection_status": "in_progress",
+        "attempt_count": 2,
+        "internship_duration_months": 3
+      }
+    },
+    {
+      "method": "PATCH",
+      "if_match_version": 5,
+      "written_fields": [
+        "collection_status",
+        "notes"
+      ],
+      "response": {
+        "id": "c002",
+        "version": 6,
+        "collection_status": "completed",
+        "attempt_count": 2,
+        "internship_duration_months": 3
+      }
+    },
+    {
+      "method": "GET",
+      "response": {
+        "id": "c002",
+        "version": 6,
+        "collection_status": "completed",
+        "attempt_count": 2,
+        "internship_duration_months": 3
+      }
+    }
+  ],
+  "decisions": [
+    {
+      "event": "candidate_fetch_started"
+    },
+    {
+      "event": "candidate_plan",
+      "version": 4,
+      "missing": [
+        "internship_duration_months"
+      ],
+      "invalid": [],
+      "needs_clarification": []
+    },
+    {
+      "event": "identity_confirmed"
+    },
+    {
+      "event": "model_request",
+      "round": 1,
+      "available_tools": [
+        "inspect_candidate_state"
+      ]
+    },
+    {
+      "event": "tool_result",
+      "tool": "inspect_candidate_state",
+      "ok": true,
+      "error": null
+    },
+    {
+      "event": "model_request",
+      "round": 2,
+      "available_tools": [
+        "inspect_candidate_state",
+        "validate_candidate_information",
+        "save_candidate_information",
+        "finish_collection"
+      ]
+    },
+    {
+      "event": "model_replied_without_tools"
+    },
+    {
+      "event": "field_retry",
+      "field": "internship_duration_months",
+      "reason": "invalid_value"
+    },
+    {
+      "event": "validation_result",
+      "accepted": [
+        "internship_duration_months"
+      ],
+      "rejected": []
+    },
+    {
+      "event": "patch_requested",
+      "fields": [
+        "attempt_count",
+        "internship_duration_months",
+        "last_contacted_at"
+      ],
+      "version": 4
+    },
+    {
+      "event": "patch_saved",
+      "fields": [
+        "attempt_count",
+        "internship_duration_months",
+        "last_contacted_at"
+      ],
+      "version": 5
+    },
+    {
+      "event": "tool_result",
+      "tool": "save_candidate_information",
+      "ok": true,
+      "error": null
+    },
+    {
+      "event": "completion_ready"
+    },
+    {
+      "event": "patch_requested",
+      "fields": [
+        "collection_status",
+        "notes"
+      ],
+      "version": 5
+    },
+    {
+      "event": "patch_saved",
+      "fields": [
+        "collection_status",
+        "notes"
+      ],
+      "version": 6
+    },
+    {
+      "event": "outcome_saved",
+      "status": "completed"
+    },
+    {
+      "event": "tool_result",
+      "tool": "finish_collection",
+      "ok": true,
+      "error": null
+    },
+    {
+      "event": "stop_result",
+      "status": "completed",
+      "ok": true
+    },
+    {
+      "event": "outcome_verification",
+      "ok": true,
+      "status": "completed"
+    }
+  ],
+  "exit_code": 0
+}
