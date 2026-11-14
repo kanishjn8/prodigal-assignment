@@ -1,14 +1,31 @@
 import json
 import re
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
 from ollama import Client
 
 import config
-from outcomes import requested_exit
-from tools import TOOL_SCHEMAS, AgentSession, CandidateAPI, CandidateTools
-from validators import is_candidate_complete
+from decision_log import RecordDecision, ignore_decision
+from outcomes import FIELD_LABELS, requested_exit
+from tools import CONFIRMATION_FIELDS, TOOL_SCHEMAS, AgentSession, CandidateAPI, CandidateTools
+from validators import is_candidate_complete, validate_field
+
+DIRECT_ANSWER_FIELDS = {"email", "cgpa", "internship_duration_months"} | CONFIRMATION_FIELDS
+RETRY_QUESTIONS = {
+    "email": "What is your email address?",
+    "graduation_year": "What is your expected graduation year?",
+    "available_from": "What is your start date (YYYY-MM-DD)?",
+    "cgpa": "What is your official CGPA on a 10-point scale?",
+    "internship_duration_months": "How many months can you intern?",
+}
+CONFIRMATION_SCHEMA = {
+    "type": "object",
+    "properties": {"decision": {"type": "string", "enum": ["accept", "edit", "unclear"]}},
+    "required": ["decision"],
+    "additionalProperties": False,
+}
 
 
 class CandidateAgent:
@@ -20,19 +37,36 @@ class CandidateAgent:
         llm: Any = None,
         model: str | None = None,
         max_tool_rounds: int = 6,
+        on_progress: Callable[[str], None] | None = None,
+        on_decision: RecordDecision = ignore_decision,
     ) -> None:
         if not 1 <= max_tool_rounds <= 12:
             raise ValueError("max_tool_rounds must be between 1 and 12.")
+        self.on_progress = on_progress or (lambda _: None)
+        self.on_decision = on_decision
+        self.on_decision("candidate_fetch_started")
+        self.on_progress("Fetching your application details")
         record = api.get_candidate(candidate_id)
         self.session = AgentSession(
             candidate_id, deepcopy(record), deepcopy(record), record["version"]
         )
         self.session.refresh(record)
-        self.tools = CandidateTools(self.session, api)
+        self.on_decision(
+            "candidate_plan",
+            version=self.session.version,
+            missing=self.session.missing_fields,
+            invalid=sorted(self.session.invalid_fields),
+            needs_clarification=sorted(self.session.pending_clarification),
+        )
+        self.tools = CandidateTools(
+            self.session, api, on_progress=self.on_progress, on_decision=self.on_decision
+        )
         self.llm = llm if llm is not None else Client(host=config.OLLAMA_BASE_URL, timeout=120.0)
         self.model = model or config.OLLAMA_MODEL
         self.max_tool_rounds = max_tool_rounds
         self.started = False
+        self.retry_field: str | None = None
+        self.awaiting_confirmation = False
         if is_candidate_complete(record):
             if record.get("collection_status") != "completed":
                 # No attempted contact: only correct the status, with no contact metadata writes.
@@ -46,8 +80,12 @@ class CandidateAgent:
                 self.session.outcome_persisted = True
                 self.session.ended = True
                 return
-        prompt = (config.PROJECT_ROOT / "prompts/system_prompt.txt").read_text()
+        prompt = (config.BACKEND_ROOT / "prompts/system_prompt.txt").read_text()
         self.session.history.append({"role": "system", "content": prompt})
+
+    def set_progress(self, callback: Callable[[str], None] | None) -> None:
+        self.on_progress = callback or (lambda _: None)
+        self.tools.on_progress = self.on_progress
 
     def start(self) -> str | None:
         if self.session.ended or self.started:
@@ -101,6 +139,7 @@ class CandidateAgent:
                     "refused_fields": [],
                 }
             session.requested_outcome = intent
+            self.on_decision("exit_detected", status=intent["collection_status"])
             self.stop()
             return self._say(self._outcome_message())
         if session.identity != "confirmed":
@@ -126,11 +165,168 @@ class CandidateAgent:
                     "Reply yes or no."
                 )
             session.identity = "confirmed"
+            self.on_decision("identity_confirmed")
         else:
             session.candidate_messages.append(message)
+            if self.awaiting_confirmation:
+                decision = "edit" if intent else self._confirmation_decision(message)
+                if decision == "unclear":
+                    return self._say(
+                        "Please use /accept to save the values shown, or /edit to change them."
+                    )
+                self.awaiting_confirmation = False
+                if decision == "accept":
+                    updates = dict(session.validated_values)
+                    session.confirmed_by_candidate = {
+                        key: value for key, value in updates.items() if key in CONFIRMATION_FIELDS
+                    }
+                    try:
+                        result = self.tools.execute(
+                            "save_candidate_information", {"updates": updates}
+                        )
+                    finally:
+                        session.confirmed_by_candidate.clear()
+                    if not result["ok"]:
+                        self.stop("needs_human", "Could not save the confirmed values safely.")
+                        return self._say(self._outcome_message())
+                    self.retry_field = None
+                    return self._run_turn()
+                declined = session.validated_values.keys() & CONFIRMATION_FIELDS
+                if len(declined) == 1:
+                    self.retry_field = next(iter(declined))
+                if intent is None and message.strip().casefold() in {"no", "/edit"}:
+                    session.validated_values.clear()
+                    return self._say(
+                        RETRY_QUESTIONS[self.retry_field]
+                        if self.retry_field
+                        else "Please provide your corrected graduation year and start date."
+                    )
             session.validated_values.clear()
             session.requested_outcome = intent
+            if intent:
+                self.on_decision("exit_detected", status=intent["collection_status"])
+            if intent is None:
+                correction = self._check_direct_answer(message)
+                if correction:
+                    return self._say(correction)
         return self._run_turn()
+
+    def _check_direct_answer(self, message: str) -> str | None:
+        answer = message.strip()
+        field = self.retry_field
+        if field is None:
+            previous = next(
+                (
+                    entry.get("content", "")
+                    for entry in reversed(self.session.history[:-1])
+                    if entry["role"] == "assistant" and not entry.get("tool_calls")
+                ),
+                "",
+            )
+            if previous.count("?") != 1:
+                return None
+            question = re.split(r"[.!]\s+", previous.split("?")[0])[-1]
+            fields = [
+                key for key, pattern in FIELD_LABELS.items() if re.search(pattern, question, re.I)
+            ]
+            if len(fields) != 1 or fields[0] not in DIRECT_ANSWER_FIELDS:
+                return None
+            field = fields[0]
+        if field == "internship_duration_months":
+            duration = re.fullmatch(r"([0-9]{1,15})\s*months?\.?", answer, re.I)
+            if duration:
+                answer = duration[1]
+        if not re.fullmatch(r"[^\s?]+", answer):
+            return None
+        value: str | int | float = answer
+        if field not in {"email", "available_from"}:
+            if re.fullmatch(r"[+-]?[0-9]{1,15}", answer):
+                value = int(answer)
+            elif field == "cgpa" and re.fullmatch(r"[+-]?[0-9]{1,15}\.[0-9]{1,15}", answer):
+                value = float(answer)
+            elif not self.retry_field:
+                return None
+        self.on_progress("Validating your answer")
+        result = validate_field(field, value)
+        if result["valid"]:
+            if field in CONFIRMATION_FIELDS:
+                self.tools.validate_candidate_information({field: value}, {field: answer})
+                if field in self.session.validated_values:
+                    return self._confirmation_question()
+            if field == "internship_duration_months":
+                validated = self.tools.validate_candidate_information(
+                    {field: value}, {field: answer}
+                )
+                if not validated["ok"]:
+                    self.retry_field = field
+                    return RETRY_QUESTIONS[field]
+                saved = self.tools.execute(
+                    "save_candidate_information", {"updates": {field: value}}
+                )
+                if not saved["ok"]:
+                    self.stop("needs_human", "Could not save the internship duration safely.")
+                    return self._outcome_message()
+                self.retry_field = None
+            return None
+        self.retry_field = field
+        self.session.validation_errors[field] = result["error"]
+        self.on_decision("field_retry", field=field, reason="invalid_value")
+        return f"{result['error']} {RETRY_QUESTIONS[field]}"
+
+    def _confirmation_question(self) -> str:
+        self.awaiting_confirmation = True
+        self.on_decision(
+            "confirmation_requested",
+            fields=sorted(self.session.validated_values.keys() & CONFIRMATION_FIELDS),
+        )
+        labels = {"available_from": "start date", "internship_duration_months": "duration (months)"}
+        values = ", ".join(
+            f"{labels.get(key, key.replace('_', ' '))}: {value}"
+            for key, value in self.session.validated_values.items()
+        )
+        return f"Please confirm {values}. Use /accept to save or /edit to make a correction."
+
+    def _confirmation_decision(self, message: str) -> str:
+        answer = message.strip().casefold()
+        if answer in {"yes", "/accept"}:
+            return "accept"
+        if answer in {"no", "/edit"} or re.fullmatch(r"[0-9]+(?:-[0-9]+){0,2}", answer):
+            return "edit"
+        try:
+            self.on_progress("Checking your confirmation")
+            response = self.llm.chat(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Classify the reply to the displayed values. Accept only explicit, "
+                            "unconditional agreement to all values. Use edit for any correction or "
+                            "rejection, even if the reply begins with agreement. "
+                            "Use unclear otherwise."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "displayed_values": self.session.validated_values,
+                                "reply": message,
+                            }
+                        ),
+                    },
+                ],
+                format=CONFIRMATION_SCHEMA,
+                stream=False,
+                options={"temperature": 0, "num_predict": 48},
+            )
+            decision = json.loads(response.message.content or "").get("decision")
+        except Exception:
+            decision = "unclear"
+        if decision not in ("accept", "edit"):
+            decision = "unclear"
+        self.on_decision("confirmation_classified", decision=decision)
+        return decision
 
     def _say(self, message: str) -> str:
         self.session.history.append({"role": "assistant", "content": message})
@@ -140,13 +336,28 @@ class CandidateAgent:
         session = self.session
         correction = ""
         for round_index in range(self.max_tool_rounds + 1):
+            if (
+                session.identity == "confirmed"
+                and session.requested_outcome is None
+                and not session.validated_values
+                and self.tools.ready_to_complete()
+            ):
+                self.on_decision("completion_ready")
+                result = self.stop("completed", "")
+                if not result["ok"]:
+                    return self._say(
+                        "Your application details are saved, "
+                        "but I couldn't verify the completion status."
+                    )
+                return self._say(self._outcome_message())
             inspected = any(
                 entry["name"] == "inspect_candidate_state" and entry["result"].get("ok")
                 for entry in session.tool_calls
             )
             available_tools = TOOL_SCHEMAS
             action = (
-                "Choose the next useful question or tool from actual state and the latest reply."
+                "Choose the next useful question or tool from actual state and the latest reply. "
+                f"Current missing fields: {', '.join(session.missing_fields) or 'none'}."
             )
             if not inspected:
                 available_tools = TOOL_SCHEMAS[:1]
@@ -163,18 +374,16 @@ class CandidateAgent:
                     + json.dumps(session.requested_outcome)
                     + ". Do not ask another question or schedule anything."
                 )
-            elif self.tools.ready_to_complete():
-                available_tools = TOOL_SCHEMAS[3:]
-                action = "Call finish_collection now with completed, notes and refused_fields=[]."
+            elif self.retry_field:
+                action = (
+                    f"Resolve {self.retry_field} before asking about any other field. "
+                    "Use validate_candidate_information if the latest reply supplies the value."
+                )
             messages = deepcopy(session.history)
             messages[0]["content"] += (
                 "\nAPPLICATION STATE: Identity confirmed. " + action + " " + correction
             )
-            if (
-                session.validated_values
-                or self.tools.ready_to_complete()
-                or session.requested_outcome
-            ):
+            if session.validated_values or session.requested_outcome or self.retry_field:
                 # Application control is never added to candidate evidence.
                 messages.append(
                     {
@@ -184,6 +393,12 @@ class CandidateAgent:
                     }
                 )
             try:
+                self.on_decision(
+                    "model_request",
+                    round=round_index + 1,
+                    available_tools=[schema["function"]["name"] for schema in available_tools],
+                )
+                self.on_progress("Preparing a reply")
                 response = self.llm.chat(
                     model=self.model,
                     messages=messages,
@@ -204,6 +419,7 @@ class CandidateAgent:
             session.history.append(assistant)
             calls = assistant.get("tool_calls") or []
             if not calls:
+                self.on_decision("model_replied_without_tools")
                 text = assistant.get("content", "").strip()
                 if session.requested_outcome and not session.validated_values:
                     session.history.pop()
@@ -215,10 +431,16 @@ class CandidateAgent:
                     session.history.pop()
                     correction = "Emit a native tool call, never simulated tool results in prose."
                     continue
-                if session.validated_values or self.tools.ready_to_complete():
+                if session.validated_values:
                     session.history.pop()
                     correction = "The operation is still pending. Emit a native tool call now."
                     continue
+                if self.retry_field:
+                    field = self.retry_field
+                    error = session.validation_errors.get(field)
+                    session.history.pop()
+                    question = RETRY_QUESTIONS[field]
+                    return self._say(f"{error} {question}" if error else question)
                 if not text:
                     self.stop("needs_human", "Model returned neither text nor a tool request.")
                     return self._say("I couldn't continue reliably; this needs human review.")
@@ -255,6 +477,16 @@ class CandidateAgent:
                 )
             if session.ended:
                 return self._say(self._outcome_message())
+            if (
+                session.requested_outcome is None
+                and session.validated_values.keys() & CONFIRMATION_FIELDS
+            ):
+                return self._say(self._confirmation_question())
+            if (
+                self.retry_field in session.confirmed_values
+                and self.retry_field not in session.validation_errors
+            ):
+                self.retry_field = None
             if session.disputed_fields:
                 session.requested_outcome = None
                 self.stop(
@@ -262,6 +494,7 @@ class CandidateAgent:
                 )
                 return self._say(self._outcome_message())
             if limited:
+                self.on_decision("tool_limit_reached")
                 break
         self.stop("needs_human", "Tool-call safety limit reached; review before continuing.")
         return self._say("I couldn't resolve this reliably; this needs human review.")
@@ -296,7 +529,8 @@ class CandidateAgent:
         if self.session.ended:
             return {"ok": self.session.outcome_persisted, "ended": True}
         if status == "no_answer" and (
-            self.session.confirmed_values or self.session.validated_values
+            self.session.confirmed_values
+            or self.session.validated_values.keys() - CONFIRMATION_FIELDS
         ):
             status = "in_progress"
             notes = "Candidate left after providing information; retain saved progress."
@@ -306,6 +540,7 @@ class CandidateAgent:
             "refused_fields": [],
         }
         result = self.tools.execute("finish_collection", arguments)
+        self.on_decision("stop_result", status=arguments["collection_status"], ok=result["ok"])
         if not result["ok"]:
             self.session.last_error = result.get("error")
             self.session.outcome = "needs_human"

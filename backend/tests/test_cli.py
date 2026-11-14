@@ -1,3 +1,4 @@
+import json
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
@@ -69,6 +70,40 @@ def test_required_candidate_id(capsys) -> None:
         main.main([])
     assert caught.value.code == 2
     assert "--candidate-id" in capsys.readouterr().err
+
+
+def test_decision_log_records_dispute_without_record_values(
+    setup_cli, monkeypatch, tmp_path, capsys
+):
+    email = "private-test@example.com"
+    api, _ = setup_cli(
+        inputs=["yes", f"My email is {email} and my CGPA is 6.5"],
+        responses=[
+            calls(("inspect_candidate_state", {})),
+            text(),
+            calls(
+                (
+                    "validate_candidate_information",
+                    {
+                        "information": {"email": email, "cgpa": 6.5},
+                        "evidence": {"email": email, "cgpa": "6.5"},
+                    },
+                ),
+                ("save_candidate_information", {"updates": {"cgpa": 6.5}}),
+            ),
+        ],
+    )
+    monkeypatch.setattr(main.config, "PROJECT_ROOT", tmp_path)
+    assert main.main(["--candidate-id", "c-test", "--decision-log"]) == 0
+    (path,) = (tmp_path / "runs").glob("decision-*.jsonl")
+    assert str(path) in capsys.readouterr().out
+    content = path.read_text()
+    assert email not in content and "6.5" not in content and "Test Candidate" not in content
+    events = [json.loads(line) for line in content.splitlines()]
+    assert any(row["event"] == "update_blocked" and row["field"] == "cgpa" for row in events)
+    assert any(row["event"] == "outcome_saved" and row["status"] == "needs_human" for row in events)
+    assert events[-1]["event"] == "outcome_verification" and events[-1]["ok"]
+    assert api.record["cgpa"] == RECORD["cgpa"]
 
 
 @pytest.mark.parametrize("candidate_id", ["", " ", "../schema", "c001?x=1", "a/b"])
@@ -152,6 +187,10 @@ def test_multi_turn_and_normal_completion(setup_cli, capsys) -> None:
     output = capsys.readouterr().out
     assert "Only your email is missing" in output
     assert "completed (verified in database)" in output
+    assert "Preparing a reply..." in output
+    assert "Validating your answer..." in output
+    assert "Updating the candidate database..." in output
+    assert "Thinking..." not in output
     assert api.record["email"] == "test@example.com"
     assert api.record["college"] == original["college"]
     assert api.get_count == 2 and len(api.writes) == 2

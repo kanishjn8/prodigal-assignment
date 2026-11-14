@@ -189,12 +189,6 @@ def test_multiple_tools_validate_save_and_finish() -> None:
             validate_email(),
             ("save_candidate_information", {"updates": {"email": "test@example.com"}}),
         ),
-        calls(
-            (
-                "finish_collection",
-                {"collection_status": "completed", "notes": "", "refused_fields": []},
-            )
-        ),
         api=api,
     )
     reply = agent.respond("My email is test@example.com")
@@ -203,7 +197,6 @@ def test_multiple_tools_validate_save_and_finish() -> None:
         "inspect_candidate_state",
         "validate_candidate_information",
         "save_candidate_information",
-        "finish_collection",
     ]
     assert agent.session.confirmed_values == {"email": "test@example.com"}
     assert agent.session.ended and agent.session.outcome_persisted
@@ -212,6 +205,7 @@ def test_multiple_tools_validate_save_and_finish() -> None:
     assert len(api.writes) == 2
     assert [write["version"] for write in api.writes] == [1, 2]
     assert "college" not in api.writes[0]["changes"]
+    assert len(agent.llm.requests) == 3
 
 
 def test_invalid_and_fabricated_values_rejected() -> None:
@@ -290,9 +284,250 @@ def test_loop_limit_persists_escalation() -> None:
 @pytest.mark.parametrize("error", [RuntimeError("secret"), httpx.ReadTimeout("secret")])
 def test_inference_failure_safe_and_persisted(error: Exception) -> None:
     agent = confirmed_agent(error)
-    assert "secret" not in agent.respond("Hello")
+    assert "secret" not in agent.respond("Why do you need my email address?")
     assert agent.session.ended and agent.session.outcome == "needs_human"
     assert agent.session.outcome_persisted
+
+
+def test_invalid_year_stays_on_year_until_corrected() -> None:
+    api = FakeAPI({**RECORD, "graduation_year": None})
+    llm = FakeLLM(
+        calls(("inspect_candidate_state", {})),
+        text("What is your expected graduation year?"),
+        text("What is your email address?"),
+    )
+    agent = CandidateAgent("c-test", api, llm=llm)
+    agent.start()
+    agent.respond("yes")
+    for answer in ("2100", "yes", "2029"):
+        reply = agent.respond(answer)
+        assert reply == (
+            "Graduation year must be 2026, 2027, or 2028. What is your expected graduation year?"
+        )
+    assert len(llm.requests) == 2 and not api.writes
+    assert "graduation year: 2027" in agent.respond("2027")
+    assert not api.writes
+    assert agent.respond("yes") == "What is your email address?"
+    assert api.record["graduation_year"] == 2027
+
+
+@pytest.mark.parametrize("invalid", ["5", "5 months"])
+def test_duration_question_does_not_route_to_cgpa(invalid: str) -> None:
+    api = FakeAPI({**RECORD, "internship_duration_months": None, "cgpa": None})
+    llm = FakeLLM(
+        calls(("inspect_candidate_state", {})),
+        text("Can you tell me how many months you're looking to commit to the internship?"),
+        text("What is your official CGPA?"),
+    )
+    agent = CandidateAgent("c-test", api, llm=llm)
+    agent.start()
+    agent.respond("yes")
+    assert agent.respond(invalid) == (
+        "Internship duration must be 2, 3, or 6 months. How many months can you intern?"
+    )
+    assert len(llm.requests) == 2 and not api.writes
+    assert agent.respond("3 months") == "What is your official CGPA?"
+    assert api.record["internship_duration_months"] == 3
+    assert api.record["cgpa"] is None
+
+
+def test_last_duration_completes_without_another_model_call() -> None:
+    api = FakeAPI(
+        {
+            **RECORD,
+            "email": "test@example.com",
+            "internship_duration_months": None,
+        }
+    )
+    llm = FakeLLM(
+        calls(("inspect_candidate_state", {})),
+        text("How many months can you intern?"),
+    )
+    agent = CandidateAgent("c-test", api, llm=llm)
+    agent.start()
+    agent.respond("yes")
+    assert "2, 3, or 6 months" in agent.respond("5")
+    assert "complete and saved" in agent.respond("3")
+    assert len(llm.requests) == 2
+    assert api.record["internship_duration_months"] == 3
+    assert api.record["collection_status"] == "completed"
+    assert api.record["attempt_count"] == 1
+
+
+def test_only_completion_write_fails_reports_saved_details() -> None:
+    class StatusFailureAPI(FakeAPI):
+        def update_candidate(self, candidate_id, changes, version):
+            if changes.get("collection_status") == "completed":
+                raise APIError("timeout", "Completion write not confirmed")
+            return super().update_candidate(candidate_id, changes, version)
+
+    api = StatusFailureAPI(
+        {
+            **RECORD,
+            "email": "test@example.com",
+            "internship_duration_months": None,
+        }
+    )
+    llm = FakeLLM(calls(("inspect_candidate_state", {})), text("How many months can you intern?"))
+    agent = CandidateAgent("c-test", api, llm=llm)
+    agent.start()
+    agent.respond("yes")
+    assert "details are saved, but I couldn't verify the completion status" in agent.respond("3")
+    assert api.record["internship_duration_months"] == 3
+    assert api.record["collection_status"] == "in_progress"
+    assert not agent.session.outcome_persisted
+
+
+def test_iso_date_is_accepted_and_can_be_corrected_before_save() -> None:
+    api = FakeAPI({**RECORD, "available_from": None})
+    llm = FakeLLM(
+        calls(("inspect_candidate_state", {})),
+        text("Can you provide the exact date when you'll be available to start in YYYY-MM-DD?"),
+        text("What is your email address?"),
+    )
+    agent = CandidateAgent("c-test", api, llm=llm)
+    agent.start()
+    agent.respond("yes")
+    assert "start date: 2027-01-02" in agent.respond("2027-01-02")
+    assert "start date: 2027-01-03" in agent.respond("2027-01-03")
+    assert not api.writes
+    assert (
+        "confirmation_required"
+        == agent.tools.save_candidate_information({"available_from": "2027-01-03"})["error"]
+    )
+    agent.respond("yes")
+    assert api.record["available_from"] == "2027-01-03"
+
+
+@pytest.mark.parametrize("affirmation", ["yeah thats correct", "Yeah, that’s correct!", "yep"])
+def test_structured_confirmation_commits_staged_values(affirmation: str) -> None:
+    api = FakeAPI(
+        {
+            **RECORD,
+            "email": "test@example.com",
+            "available_from": None,
+            "internship_duration_months": None,
+        }
+    )
+    agent = confirmed_agent(
+        calls(
+            (
+                "validate_candidate_information",
+                {
+                    "information": {
+                        "available_from": "2026-01-01",
+                        "internship_duration_months": 3,
+                    },
+                    "evidence": {"available_from": "2026-01-01", "internship_duration_months": "3"},
+                },
+            )
+        ),
+        text('{"decision":"accept"}'),
+        api=api,
+    )
+    reply = agent.respond("I can start on 2026-01-01 and intern for 3 months.")
+    assert "start date: 2026-01-01" in reply
+    assert "duration (months): 3" in reply
+    assert not api.writes
+    assert "complete and saved" in agent.respond(affirmation)
+    assert api.record["available_from"] == "2026-01-01"
+    assert api.record["internship_duration_months"] == 3
+    assert agent.llm.requests[-1]["format"]["required"] == ["decision"]
+    assert len(agent.llm.requests) == 4
+
+
+def test_unclear_confirmation_keeps_pending_values_without_writing() -> None:
+    api = FakeAPI({**RECORD, "available_from": None})
+    agent = confirmed_agent(
+        calls(
+            (
+                "validate_candidate_information",
+                {
+                    "information": {"available_from": "2026-01-01"},
+                    "evidence": {"available_from": "2026-01-01"},
+                },
+            )
+        ),
+        text("invalid classifier response"),
+        text("What is your email address?"),
+        api=api,
+    )
+    agent.respond("I can start on 2026-01-01.")
+    assert "/accept" in agent.respond("What are the next steps?")
+    assert agent.awaiting_confirmation and not api.writes
+    agent.respond("/accept")
+    assert api.record["available_from"] == "2026-01-01"
+
+
+def test_agreement_with_correction_does_not_save_previous_value() -> None:
+    api = FakeAPI({**RECORD, "available_from": None})
+    agent = confirmed_agent(
+        calls(
+            (
+                "validate_candidate_information",
+                {
+                    "information": {"available_from": "2026-01-01"},
+                    "evidence": {"available_from": "2026-01-01"},
+                },
+            )
+        ),
+        text('{"decision":"edit"}'),
+        calls(
+            (
+                "validate_candidate_information",
+                {
+                    "information": {"available_from": "2026-02-01"},
+                    "evidence": {"available_from": "2026-02-01"},
+                },
+            )
+        ),
+        api=api,
+    )
+    agent.respond("I can start on 2026-01-01.")
+    assert "2026-02-01" in agent.respond("Yes, but change the start date to 2026-02-01.")
+    assert agent.awaiting_confirmation and not api.writes
+
+
+def test_readback_does_not_stage_a_date_only_the_model_supplied() -> None:
+    api = FakeAPI({**RECORD, "available_from": None})
+    agent = confirmed_agent(
+        text("Can you confirm the start date is 2026-01-01?"),
+        text("Please provide your start date."),
+        api=api,
+    )
+    agent.respond("I can start in January.")
+    agent.respond("yeah thats correct")
+    assert not api.writes
+    assert api.record["available_from"] is None
+
+
+def test_model_extracted_year_cannot_skip_confirmation() -> None:
+    agent = confirmed_agent(
+        calls(
+            (
+                "validate_candidate_information",
+                {
+                    "information": {"graduation_year": 2027},
+                    "evidence": {"graduation_year": "2027"},
+                },
+            ),
+            ("save_candidate_information", {"updates": {"graduation_year": 2027}}),
+        ),
+        api=FakeAPI({**RECORD, "graduation_year": None}),
+    )
+    assert "graduation year: 2027" in agent.respond("I graduate in 2027")
+    assert not agent.tools.api.writes
+    agent.stop()
+    assert agent.tools.api.record["graduation_year"] is None
+    assert agent.session.outcome == "no_answer"
+
+
+def test_invalid_email_gets_focused_retry() -> None:
+    agent = confirmed_agent()
+    reply = agent.respond("abdadde")
+    assert reply.endswith("What is your email address?")
+    assert "valid email address" in reply
+    assert len(agent.llm.requests) == 2
 
 
 def test_existing_invalid_data_in_plan() -> None:
@@ -525,7 +760,6 @@ def test_real_ollama_agent_with_fake_api() -> None:
         "inspect_candidate_state",
         "validate_candidate_information",
         "save_candidate_information",
-        "finish_collection",
     } <= successful
     assert api.record["email"] == "test@example.com"
     assert agent.session.outcome == "completed" and agent.session.outcome_persisted

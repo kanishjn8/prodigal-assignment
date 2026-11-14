@@ -14,3 +14,4 @@ htmlcov/
 *.pem
 *.key
 ASSIGNMENT.md
+runs/decision-*.jsonl

@@ -3,7 +3,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+BACKEND_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = BACKEND_ROOT.parent
+load_dotenv(BACKEND_ROOT / ".env", override=False)
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")

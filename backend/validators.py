@@ -119,7 +119,12 @@ def _validate_value(field_name: str, value: Any) -> Any:
             "attempt_count": range(51),
         }
         if type(value) is not int or value not in allowed[field_name]:
-            raise ValueError(f"Expected an integer in {allowed[field_name]}.")
+            descriptions = {
+                "graduation_year": "Graduation year must be 2026, 2027, or 2028.",
+                "internship_duration_months": "Internship duration must be 2, 3, or 6 months.",
+                "attempt_count": "Attempt count must be an integer from 0 through 50.",
+            }
+            raise ValueError(descriptions[field_name])
         return value
     if field_name == "skills":
         if (

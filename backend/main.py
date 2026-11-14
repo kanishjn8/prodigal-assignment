@@ -1,6 +1,7 @@
 import argparse
 import re
 from collections.abc import Sequence
+from contextlib import ExitStack
 
 import httpx
 from ollama import Client, ResponseError
@@ -9,6 +10,7 @@ import config
 import terminal_ui as ui
 from agent import CandidateAgent
 from api_client import WRITABLE_FIELDS, APIError, CandidateAPIClient
+from decision_log import ignore_decision, open_decision_log
 from validators import is_candidate_complete
 
 HELP_TEXT = (
@@ -34,6 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Candidate record ID supplied by the evaluator (for example c001)",
     )
     parser.epilog = HELP_TEXT
+    parser.add_argument(
+        "--decision-log",
+        action="store_true",
+        help="Write a redacted decision log under runs/ and print its path",
+    )
     return parser
 
 
@@ -52,14 +59,20 @@ def chat(agent: CandidateAgent) -> None:
                 with ui.busy("Saving conversation outcome"):
                     agent.stop(notes=f"Candidate ended the chat with {reply}.")
                 break
-            if reply.startswith("/"):
+            if reply.startswith("/") and not (
+                agent.awaiting_confirmation and reply in {"/accept", "/edit"}
+            ):
                 print("Unknown command. Use /help or /quit.", flush=True)
                 continue
             if not reply:
                 print("Please enter a reply, or use /quit to exit.", flush=True)
                 continue
-            with ui.busy("Thinking"):
-                response = agent.respond(reply)
+            with ui.busy("Reviewing your reply") as progress:
+                agent.set_progress(progress)
+                try:
+                    response = agent.respond(reply)
+                finally:
+                    agent.set_progress(None)
             if response:
                 ui.agent_message(response)
     except (EOFError, KeyboardInterrupt):
@@ -71,6 +84,7 @@ def chat(agent: CandidateAgent) -> None:
 def verify_outcome(agent: CandidateAgent, api: CandidateAPIClient) -> int:
     session = agent.session
     if not session.outcome_persisted:
+        agent.on_decision("outcome_verification", ok=False, reason="unconfirmed_write")
         print(
             "Outcome could not be saved reliably. Human review is required; do not retry blindly."
         )
@@ -87,10 +101,12 @@ def verify_outcome(agent: CandidateAgent, api: CandidateAPIClient) -> int:
         or any(record.get(key) != session.latest_candidate.get(key) for key in changed)
         or (session.outcome == "completed" and not is_candidate_complete(record))
     ):
+        agent.on_decision("outcome_verification", ok=False, reason="record_mismatch")
         print(
             "Database verification found a mismatch or concurrent change. Human review is required."
         )
         return 1
+    agent.on_decision("outcome_verification", ok=True, status=session.outcome)
     print(ui.styled(f"\nOutcome: {session.outcome} (verified in database).", "1;32"), flush=True)
     return 0
 
@@ -100,11 +116,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     ui.banner()
     agent = None
     try:
-        with CandidateAPIClient() as api:
+        with ExitStack() as resources:
+            record = ignore_decision
+            if args.decision_log:
+                try:
+                    path, record = resources.enter_context(
+                        open_decision_log(config.PROJECT_ROOT / "runs")
+                    )
+                    print(f"Decision log: {path}", flush=True)
+                except OSError:
+                    print("Could not open the decision log. Continuing the chat.")
+            api = resources.enter_context(CandidateAPIClient())
             llm = Client(host=config.OLLAMA_BASE_URL, timeout=120.0)
             # The startup GET checks reachability and authentication without a redundant API call.
             with ui.busy("Checking candidate record"):
-                agent = CandidateAgent(args.candidate_id, api, llm=llm)
+                agent = CandidateAgent(args.candidate_id, api, llm=llm, on_decision=record)
             if agent.session.ended:
                 if agent.session.outcome == "completed":
                     print("All mandatory information is valid. No chat needed.")
@@ -125,7 +151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return verify_outcome(agent, api)
     except APIError as exc:
         explanations = {
-            "missing_api_key": "Set CANDIDATE_API_KEY in your local .env file.",
+            "missing_api_key": "Set CANDIDATE_API_KEY in backend/.env or the repository root .env.",
             "authentication": "Candidate API authentication failed. Check your local API key.",
             "not_found": "Candidate record was not found. Check the supplied candidate ID.",
             "timeout": "Candidate API timed out. Check connectivity before retrying.",

@@ -1,11 +1,13 @@
 import json
 import re
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from api_client import WRITABLE_FIELDS, APIError, VersionConflict
+from decision_log import RecordDecision, ignore_decision
 from outcomes import outcome_notes
 from validators import (
     MANDATORY_FIELDS,
@@ -17,6 +19,7 @@ from validators import (
 
 TRACKING_FIELDS = {"collection_status", "attempt_count", "last_contacted_at", "notes"}
 PROFILE_FIELDS = WRITABLE_FIELDS - TRACKING_FIELDS
+CONFIRMATION_FIELDS = {"graduation_year", "available_from"}
 PROFILE_PROPERTIES = {key: {"type": "string"} for key in sorted(PROFILE_FIELDS)}
 PROFILE_PROPERTIES.update(
     {
@@ -51,6 +54,7 @@ class AgentSession:
     identity: str = "unconfirmed"
     confirmed_values: dict[str, Any] = field(default_factory=dict)
     validated_values: dict[str, Any] = field(default_factory=dict)
+    confirmed_by_candidate: dict[str, Any] = field(default_factory=dict)
     validation_errors: dict[str, str] = field(default_factory=dict)
     refused_fields: list[str] = field(default_factory=list)
     history: list[dict[str, Any]] = field(default_factory=list)
@@ -139,11 +143,32 @@ def _error(code: str, message: str) -> dict[str, Any]:
 
 
 class CandidateTools:
-    def __init__(self, session: AgentSession, api: CandidateAPI) -> None:
+    def __init__(
+        self,
+        session: AgentSession,
+        api: CandidateAPI,
+        on_progress: Callable[[str], None] | None = None,
+        on_decision: RecordDecision = ignore_decision,
+    ) -> None:
         self.session = session
         self.api = api
+        self.on_progress = on_progress or (lambda _: None)
+        self.on_decision = on_decision
 
     def execute(self, name: str, arguments: Any) -> dict[str, Any]:
+        result = self._execute(name, arguments)
+        self.on_decision(
+            "tool_result",
+            tool=name
+            if isinstance(name, str)
+            and name in {schema["function"]["name"] for schema in TOOL_SCHEMAS}
+            else "unknown",
+            ok=result["ok"],
+            error=result.get("error"),
+        )
+        return result
+
+    def _execute(self, name: str, arguments: Any) -> dict[str, Any]:
         registry = {
             "inspect_candidate_state": self.inspect_candidate_state,
             "validate_candidate_information": self.validate_candidate_information,
@@ -169,6 +194,7 @@ class CandidateTools:
             return _error("tool_failure", "Tool failed unexpectedly; request human review.")
 
     def inspect_candidate_state(self) -> dict[str, Any]:
+        self.on_progress("Checking what’s still needed")
         session = self.session
         if session.identity != "confirmed":
             return {
@@ -212,6 +238,7 @@ class CandidateTools:
             return _error(
                 "unsupported_fields", "Only writable candidate profile fields are allowed."
             )
+        self.on_progress("Validating your answer")
         result = validate_fields(information)
         refused = set((session.requested_outcome or {}).get("refused_fields", []))
         for key in refused & information.keys():
@@ -233,6 +260,9 @@ class CandidateTools:
                 result["errors"][key] = "Quote the exact value from a confirmed candidate reply."
                 del result["data"][key]
         session.validation_errors.update(result["errors"])
+        self.on_decision(
+            "validation_result", accepted=sorted(result["data"]), rejected=sorted(result["errors"])
+        )
         for key in result["data"]:
             session.validation_errors.pop(key, None)
         session.validated_values.update(deepcopy(result["data"]))
@@ -296,6 +326,10 @@ class CandidateTools:
                 return _error(
                     "validation_required", "Validate quoted candidate input before saving."
                 )
+            if key in CONFIRMATION_FIELDS and session.confirmed_by_candidate.get(key) != value:
+                return _error(
+                    "confirmation_required", "Read back the value and wait for confirmation."
+                )
             if key in session.conflict_fields and session.latest_candidate.get(key) != value:
                 return _error(
                     "conflict", "A concurrent edit changed this field; needs human review."
@@ -304,6 +338,7 @@ class CandidateTools:
             old_result = validate_fields({key: existing})
             if old_result["valid"] and existing != value and old_result["data"][key] != value:
                 session.disputed_fields.add(key)
+                self.on_decision("update_blocked", field=key, reason="existing_valid_value")
                 session.validated_values.pop(key, None)
                 return _error(
                     "existing_value", "Keep existing valid data; escalate disputed values."
@@ -344,6 +379,8 @@ class CandidateTools:
         if not patch:
             return {"ok": True, "saved": False, "changed_fields": []}
         try:
+            self.on_decision("patch_requested", fields=sorted(patch), version=session.version)
+            self.on_progress("Updating the candidate database")
             updated = self.api.update_candidate(session.candidate_id, patch, session.version)
             session.refresh(updated)
         except KeyboardInterrupt:
@@ -352,6 +389,7 @@ class CandidateTools:
             session.last_error = "interrupted_write"
             raise
         except VersionConflict as exc:
+            self.on_decision("patch_conflict", refreshed=exc.latest_candidate is not None)
             session.validated_values.clear()
             if exc.latest_candidate is not None:
                 latest = exc.latest_candidate
@@ -372,6 +410,7 @@ class CandidateTools:
                 "conflict_fields": sorted(session.conflict_fields),
             }
         except APIError as exc:
+            self.on_decision("patch_failed", reason=exc.kind, status_code=exc.status_code)
             session.write_blocked = True
             session.last_error = exc.kind
             return {
@@ -387,6 +426,7 @@ class CandidateTools:
             )
         if "last_contacted_at" in patch:
             session.contact_recorded = True
+        self.on_decision("patch_saved", fields=sorted(patch), version=session.version)
         return {
             "ok": True,
             "saved": True,
@@ -447,7 +487,9 @@ class CandidateTools:
         pending = {
             key: value
             for key, value in session.validated_values.items()
-            if key not in refused_fields and key not in session.disputed_fields
+            if key not in refused_fields
+            and key not in session.disputed_fields
+            and (key not in CONFIRMATION_FIELDS or session.confirmed_by_candidate.get(key) == value)
         }
         if pending and session.identity == "confirmed":
             saved = self.save_candidate_information(pending)
@@ -489,4 +531,5 @@ class CandidateTools:
             session.outcome = collection_status
             session.outcome_persisted = True
             session.ended = True
+            self.on_decision("outcome_saved", status=collection_status)
         return result

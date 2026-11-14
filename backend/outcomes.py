@@ -9,8 +9,8 @@ FIELD_LABELS = {
     "branch": r"\b(?:branch|speciali[sz]ation)\b",
     "graduation_year": r"\bgraduation\b",
     "preferred_location": r"\blocation\b",
-    "available_from": r"\b(?:start date|availability)\b",
-    "internship_duration_months": r"\bduration\b",
+    "available_from": r"\b(?:start date|availability|available to start|date when|yyyy-mm-dd)\b",
+    "internship_duration_months": r"\b(?:duration|(?:how many|number of) months)\b",
     "full_name": r"\bname\b",
 }
 

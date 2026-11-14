@@ -1,7 +1,7 @@
 [project]
 name = "prodigal"
 version = "0.1.0"
-description = "Local Ollama agent for candidate information collection (Phase 1 foundation)"
+description = "Local Ollama agent for candidate information collection"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "httpx>=0.28.1",
@@ -16,6 +16,7 @@ dev = [
 ]
 
 [tool.ruff]
+src = ["backend"]
 target-version = "py312"
 line-length = 100
 
@@ -23,5 +24,5 @@ line-length = 100
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
+testpaths = ["backend/tests"]
+pythonpath = ["backend"]

@@ -2,7 +2,7 @@ import os
 import shutil
 import sys
 import textwrap
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from threading import Event, Thread
 from time import monotonic
@@ -43,11 +43,18 @@ def input_prompt() -> str:
 
 
 @contextmanager
-def busy(label: str) -> Iterator[None]:
+def busy(label: str) -> Iterator[Callable[[str], None]]:
     """Animate only the display; keep API calls on the main thread for Ctrl+C handling."""
     if not interactive():
         print(f"{label}...", flush=True)
-        yield
+
+        def report(next_label: str) -> None:
+            nonlocal label
+            if next_label != label:
+                label = next_label
+                print(f"{label}...", flush=True)
+
+        yield report
         return
     stream = sys.stdout
     stopped = Event()
@@ -65,11 +72,15 @@ def busy(label: str) -> Iterator[None]:
             draw(frame)
             frame += 1
 
+    def report(next_label: str) -> None:
+        nonlocal label
+        label = next_label
+
     draw(0)
     worker = Thread(target=animate, name="cli-status", daemon=True)
     worker.start()
     try:
-        yield
+        yield report
     finally:
         stopped.set()
         worker.join()
