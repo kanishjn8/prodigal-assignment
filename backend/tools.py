@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from api_client import WRITABLE_FIELDS, APIError, VersionConflict
 from decision_log import RecordDecision, ignore_decision
 from outcomes import outcome_notes
+from prompt_guard import contains_prompt_override
 from validators import (
     MANDATORY_FIELDS,
     analyze_candidate,
@@ -168,6 +169,36 @@ class CandidateTools:
         )
         return result
 
+    def execute_model_call(
+        self, name: Any, arguments: Any, *, available: set[str]
+    ) -> dict[str, Any]:
+        if self.session.ended:
+            return _error("session_ended", "The session has ended.")
+        if not isinstance(name, str) or name not in {
+            schema["function"]["name"] for schema in TOOL_SCHEMAS
+        }:
+            return _error("unknown_tool", "Use only the registered tools.")
+        if name not in available:
+            self.on_decision("model_tool_blocked", reason="tool_unavailable")
+            return _error("tool_unavailable", "Use a tool offered for this turn.")
+        if name == "finish_collection":
+            requested = self.session.requested_outcome
+            if (
+                requested is None
+                or not isinstance(arguments, dict)
+                or arguments.get("collection_status") != requested["collection_status"]
+            ):
+                self.on_decision("model_tool_blocked", reason="outcome_not_authorized")
+                return _error(
+                    "outcome_not_authorized", "The application controls terminal outcomes."
+                )
+            arguments = {
+                "collection_status": requested["collection_status"],
+                "refused_fields": requested["refused_fields"],
+                "notes": "Candidate requested to end this session.",
+            }
+        return self.execute(name, arguments)
+
     def _execute(self, name: str, arguments: Any) -> dict[str, Any]:
         registry = {
             "inspect_candidate_state": self.inspect_candidate_state,
@@ -200,7 +231,6 @@ class CandidateTools:
             return {
                 "ok": True,
                 "identity": session.identity,
-                "full_name": session.latest_candidate.get("full_name"),
             }
         return {
             "ok": True,
@@ -208,11 +238,11 @@ class CandidateTools:
             "Do not reconfirm existing valid fields.",
             "identity": session.identity,
             "version": session.version,
-            "record": {
-                key: value
+            "existing_valid_fields": sorted(
+                key
                 for key, value in session.latest_candidate.items()
-                if key in PROFILE_FIELDS
-            },
+                if key in PROFILE_FIELDS and validate_fields({key: value})["valid"]
+            ),
             "missing": session.missing_fields,
             "invalid": session.invalid_fields,
             "clarification": session.pending_clarification,
@@ -274,6 +304,7 @@ class CandidateTools:
             or not quote.strip()
             or not self.session.candidate_messages
             or quote not in self.session.candidate_messages[-1]
+            or contains_prompt_override(self.session.candidate_messages[-1])
         ):
             return False
         # Exact value quotes prevent the model from supplying unrelated invented values.

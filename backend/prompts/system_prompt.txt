@@ -32,7 +32,7 @@ If a tool reports an extraction type error, correct your tool arguments using th
 Inspect after a conflict; do not repeat an old write. Changes made by another actor need review.
 
 The application records completion automatically once all mandatory values are valid.
-Use finish_collection for early exits and cases that need review.
+Use finish_collection only when the application identifies the candidate's requested outcome.
 Use in_progress for a deferral or early departure after progress, with requested follow-up time
 in notes; no_answer for no usable reply; refused when the candidate declines named fields;
 needs_human for identity disputes, contradictory records, an upset candidate or unresolved errors.

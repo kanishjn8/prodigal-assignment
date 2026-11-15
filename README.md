@@ -87,6 +87,15 @@ of a write is uncertain, further writes are blocked in that session.
 
 The agent records the status, notes, contact timestamp and attempt count when
 applicable. The CLI verifies persisted outcomes by reading the record again.
+
+Candidate messages and stored text are untrusted. The CLI blocks common
+instruction overrides, and the inspection tool exposes field names and
+validation state instead of raw profile values. Python checks which tools
+were offered and authorizes terminal outcomes. At a confirmation prompt,
+use `/accept` or reply `yes` to approve the displayed values explicitly.
+The model cannot authorize that write. Input filtering is a backstop and
+cannot recognize every adversarial message.
+
 With `--decision-log`, the CLI prints a local JSON Lines path under `runs/`.
 Follow it with `tail -f <path>` in another terminal. It includes field names,
 tool outcomes, blocked writes and status without raw candidate replies, record

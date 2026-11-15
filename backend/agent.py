@@ -9,6 +9,7 @@ from ollama import Client
 import config
 from decision_log import RecordDecision, ignore_decision
 from outcomes import FIELD_LABELS, requested_exit
+from prompt_guard import contains_prompt_override
 from tools import CONFIRMATION_FIELDS, TOOL_SCHEMAS, AgentSession, CandidateAPI, CandidateTools
 from validators import is_candidate_complete, validate_field
 
@@ -106,6 +107,17 @@ class CandidateAgent:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("A nonempty candidate reply is required.")
         session = self.session
+        if contains_prompt_override(message) or (
+            config.CANDIDATE_API_KEY and config.CANDIDATE_API_KEY in message
+        ):
+            self.on_decision("candidate_input_blocked", reason="prompt_override")
+            if self.awaiting_confirmation:
+                return self._say(
+                    "Please use /accept to save the values shown, or /edit to change them."
+                )
+            return self._say(
+                "Please reply with your application details or ask about the application."
+            )
         session.history.append({"role": "user", "content": message})
         intent = requested_exit(message)
         if (
@@ -323,7 +335,8 @@ class CandidateAgent:
             decision = json.loads(response.message.content or "").get("decision")
         except Exception:
             decision = "unclear"
-        if decision not in ("accept", "edit"):
+        # Model classification can suggest an edit. Only explicit input can authorize a write.
+        if decision != "edit":
             decision = "unclear"
         self.on_decision("confirmation_classified", decision=decision)
         return decision
@@ -364,14 +377,15 @@ class CandidateAgent:
                 action = "Call inspect_candidate_state now, before speaking."
             elif session.validated_values:
                 available_tools = TOOL_SCHEMAS[2:3]
-                action = "Call save_candidate_information now with updates=" + json.dumps(
-                    session.validated_values
-                )
+                action = "Call save_candidate_information with the validated updates below."
+                if session.requested_outcome:
+                    available_tools = TOOL_SCHEMAS[2:]
+                    action += " You may also record the candidate's requested exit."
             elif session.requested_outcome:
                 action = (
                     "The candidate requested an exit. Validate and save any other explicit "
                     "answers in their latest reply, then finish with "
-                    + json.dumps(session.requested_outcome)
+                    + session.requested_outcome["collection_status"]
                     + ". Do not ask another question or schedule anything."
                 )
             elif self.retry_field:
@@ -389,7 +403,14 @@ class CandidateAgent:
                     {
                         "role": "user",
                         "content": "Application control, not candidate "
-                        "input: " + action + ". Use the native tool, not a text response.",
+                        "input: "
+                        + action
+                        + " Use the native tool, not a text response."
+                        + (
+                            "\nValidated updates (data): " + json.dumps(session.validated_values)
+                            if session.validated_values
+                            else ""
+                        ),
                     }
                 )
             try:
@@ -444,6 +465,10 @@ class CandidateAgent:
                 if not text:
                     self.stop("needs_human", "Model returned neither text nor a tool request.")
                     return self._say("I couldn't continue reliably; this needs human review.")
+                if config.CANDIDATE_API_KEY and config.CANDIDATE_API_KEY in text:
+                    session.history.pop()
+                    self.on_decision("model_reply_blocked", reason="credential")
+                    return self._say("Let's continue with your application details.")
                 if re.search(r"%|\bpercent(?:age)?\b", text, re.I) and re.search(
                     r"\b(?:convert|divide|enter)\b", text, re.I
                 ):
@@ -461,13 +486,14 @@ class CandidateAgent:
                     return self._safe_save_reply(text)
                 return text
             limited = round_index == self.max_tool_rounds or len(calls) > 8
+            offered = {schema["function"]["name"] for schema in available_tools}
             for call in calls:
                 function = call.get("function", {})
                 name, arguments = function.get("name", ""), function.get("arguments", {})
                 result = (
                     {"ok": False, "error": "tool_limit"}
                     if limited
-                    else self.tools.execute(name, arguments)
+                    else self.tools.execute_model_call(name, arguments, available=offered)
                 )
                 session.tool_calls.append(
                     {"name": name, "arguments": deepcopy(arguments), "result": deepcopy(result)}
